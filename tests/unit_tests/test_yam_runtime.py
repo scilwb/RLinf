@@ -20,7 +20,7 @@ import numpy as np
 import pytest
 
 from rlinf.envs.real.yam.config import DualYamJointEnvConfig
-from rlinf.envs.real.yam.control_runtime import YamControlRuntime
+from rlinf.envs.real.yam.control_runtime import YamControlRuntime, YamMoveCancelled
 from rlinf.envs.real.yam.types import YamArmState
 
 
@@ -166,3 +166,60 @@ def test_command_clamps_joint_step_and_gripper_then_closes_once():
         "right",
         "left",
     ]
+
+
+@pytest.mark.parametrize(
+    ("phase", "expected_commands"),
+    [
+        ("before_move", 0),
+        ("interpolation", 1),
+        ("settling", 2),
+        ("converged_hold", 1),
+    ],
+)
+def test_cancelled_move_holds_without_closing_followers(phase, expected_commands):
+    runtime, factory = _runtime(config=DualYamJointEnvConfig(max_joint_delta=1.0))
+    runtime.connect_followers()
+    stopped = phase == "before_move"
+
+    def stop_on_sleep(_seconds):
+        nonlocal stopped
+        stopped = True
+
+    runtime._sleep = stop_on_sleep
+    if phase == "converged_hold":
+        hold = runtime.hold
+
+        def stop_during_hold():
+            stop_on_sleep(0.0)
+            return hold()
+
+        runtime.hold = stop_during_hold
+    if phase == "settling":
+        # Keep feedback at the initial pose to require a settling command.
+        for follower in factory.followers:
+            follower.command = lambda target, follower=follower: (
+                follower.commands.append(np.asarray(target).copy())
+            )
+
+    with pytest.raises(YamMoveCancelled, match="YAM move cancelled"):
+        runtime.move_to(
+            np.full(14, 0.1),
+            duration_s=0.1 if phase == "interpolation" else 0.0,
+            max_joint_delta=1.0,
+            tolerance=0.01,
+            timeout_s=1.0,
+            cancelled=lambda: stopped,
+        )
+
+    assert [len(follower.commands) for follower in factory.followers] == [
+        expected_commands,
+        expected_commands,
+    ]
+    expected_holds = 3 if phase == "converged_hold" else 2
+    assert [follower.hold_calls for follower in factory.followers] == [
+        expected_holds,
+        expected_holds,
+    ]
+    assert all(follower.close_calls == 0 for follower in factory.followers)
+    assert runtime.followers_connected

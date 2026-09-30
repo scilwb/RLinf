@@ -36,6 +36,10 @@ from .types import (
 )
 
 
+class YamMoveCancelled(RuntimeError):
+    """A move was cancelled without closing the follower transports."""
+
+
 class YamControlRuntime:
     """Own both follower transports and serialize every follower command."""
 
@@ -194,12 +198,15 @@ class YamControlRuntime:
         max_joint_delta: float,
         tolerance: float,
         timeout_s: float,
+        cancelled: Callable[[], bool] | None = None,
     ) -> np.ndarray:
         """Move followers smoothly to an absolute 14-D target and verify it.
 
         The interpolation bound is independent of normal policy/teleoperation
         limits, so reset remains gradual even when runtime slew limiting is
         disabled. The configured hard joint limits are always enforced here.
+        When ``cancelled`` returns true, attempt to hold the current pose and raise
+        ``YamMoveCancelled`` without closing the followers.
         """
         left_target, right_target = split_dual_action(target)
         target_vector = pack_dual_action(left_target, right_target)
@@ -250,10 +257,15 @@ class YamControlRuntime:
             steps * period_s,
         )
 
+        def check_cancelled() -> None:
+            if cancelled is not None and cancelled():
+                raise YamMoveCancelled("YAM move cancelled; followers remain connected")
+
         try:
             for step in range(1, steps + 1):
                 progress = step / steps
                 alpha = progress * progress * (3.0 - 2.0 * progress)
+                check_cancelled()
                 result = self.command(start + alpha * (target_vector - start))
                 if result.rejection_reason is not None:
                     raise RuntimeError(
@@ -268,8 +280,10 @@ class YamControlRuntime:
             while True:
                 measured = self.read_state().as_vector()
                 max_error = float(np.max(np.abs(target_vector - measured)))
+                check_cancelled()
                 if max_error <= tolerance:
                     held = self.hold()
+                    check_cancelled()
                     self._logger.info(
                         "YAM reset qpos reached (max error %.4f)", max_error
                     )
@@ -281,6 +295,7 @@ class YamControlRuntime:
                         f"{timeout_s:.2f}s (max error {max_error:.4f}, "
                         f"tolerance {tolerance:.4f})"
                     )
+                check_cancelled()
                 result = self.command(target_vector)
                 if result.rejection_reason is not None:
                     raise RuntimeError(

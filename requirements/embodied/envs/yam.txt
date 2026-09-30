@@ -6,6 +6,7 @@ i2rt @ git+https://github.com/i2rt-robotics/i2rt.git@47fee5e7dec4e30ca054f798bda
 opencv-python
 pyrealsense2; sys_platform == "linux" and platform_machine == "x86_64"
 pyyaml>=6.0
+gymnasium==0.29.1
 
 # PICO transport and the tested i2rt differential-IK stack (no ROS required).
 pyzmq>=25
