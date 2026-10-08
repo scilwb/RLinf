@@ -116,15 +116,27 @@ def test_yam_openpi_rejects_invalid_demonstrations(invalid_field):
         YamInputs()(data)
 
 
-def test_yam_openpi_sft_recipe_composes_without_station_configuration(monkeypatch):
+@pytest.mark.parametrize(
+    "config_dir,config_name,placement",
+    [
+        ("examples/sft/config", "realworld_dual_yam_sft_openpi_pi05", "all"),
+        ("tests/e2e_tests/sft", "yam_sft_openpi_pi05", "0-0"),
+    ],
+)
+def test_yam_openpi_sft_recipe_composes_without_station_configuration(
+    monkeypatch, config_dir, config_name, placement
+):
     from hydra import compose, initialize_config_dir
 
     repo_path = Path(__file__).resolve().parents[2]
-    monkeypatch.setenv("EMBODIED_PATH", str(repo_path / "examples/embodiment"))
+    monkeypatch.setenv("EMBODIED_PATH", str(repo_path / "examples/sft"))
+    monkeypatch.setenv("REPO_PATH", str(repo_path))
+    for name in ("YAM_SFT_DATASET", "YAM_SFT_MODEL_PATH", "YAM_SFT_NORM_STATS"):
+        monkeypatch.setenv(name, "/test/path")
     with initialize_config_dir(
-        config_dir=str(repo_path / "examples/sft/config"), version_base="1.1"
+        config_dir=str(repo_path / config_dir), version_base="1.1"
     ):
-        cfg = compose(config_name="realworld_dual_yam_sft_openpi_pi05")
+        cfg = compose(config_name=config_name)
     resolved = OmegaConf.to_container(cfg, resolve=True)
     assert resolved["actor"]["model"]["action_dim"] == 14
     assert resolved["actor"]["model"]["openpi"]["model_action_dim"] == 32
@@ -132,24 +144,11 @@ def test_yam_openpi_sft_recipe_composes_without_station_configuration(monkeypatc
     assert resolved["actor"]["model"]["openpi"]["num_images_in_input"] == 3
     assert "env" not in resolved
     assert "rollout" not in resolved
-    assert resolved["cluster"]["component_placement"] == {"actor": "all"}
-
-
-def test_openpi_validation_step_updates_parameters_and_rejects_nonfinite_loss():
-    from examples.sft.validate_openpi_sft import apply_validation_step
-
-    model = torch.nn.Linear(14, 14)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=0.01)
-    before = model.weight.detach().clone()
-    loss = model(torch.ones(2, 14)).square().mean()
-    metrics = apply_validation_step(loss, model, optimizer, clip_grad=1.0)
-    assert np.isfinite(metrics["loss"])
-    assert metrics["grad_norm"] > 0
-    assert not torch.equal(before, model.weight)
-    with pytest.raises(ValueError, match="finite scalar loss"):
-        apply_validation_step(
-            torch.tensor(float("nan")), model, optimizer, clip_grad=1.0
-        )
+    assert resolved["cluster"]["component_placement"] == {"actor": placement}
+    assert "validation" not in resolved
+    if config_dir.startswith("tests/"):
+        assert resolved["runner"]["max_steps"] == 2
+        assert resolved["actor"]["optim"]["total_training_steps"] == 2
 
 
 def test_yam_openpi_recorded_dataset_uses_the_official_sft_loader(
@@ -161,7 +160,6 @@ def test_yam_openpi_recorded_dataset_uses_the_official_sft_loader(
     from openpi.models import tokenizer
     from openpi.shared import normalize
 
-    from examples.sft.validate_openpi_sft import validate_batch
     from rlinf.data.datasets.openpi import build_openpi_sft_dataloader
     from rlinf.data.storage.lerobot.writer import LeRobotDatasetWriter
 
@@ -229,16 +227,27 @@ def test_yam_openpi_recorded_dataset_uses_the_official_sft_loader(
     loader, _ = build_openpi_sft_dataloader(
         cfg, world_size=1, rank=0, data_paths=str(dataset_path)
     )
-    batch = next(iter(loader))
-    metrics = validate_batch(batch, cfg.actor.model)
-    assert metrics == {"batch_size": 1, "action_horizon": 10, "model_action_dim": 32}
+    observation, actions = next(iter(loader))
+    assert observation.state.shape == (1, 32)
+    assert actions.shape == (1, 10, 32)
+    assert torch.isfinite(observation.state).all() and torch.isfinite(actions).all()
+    assert set(observation.images) == {
+        "base_0_rgb",
+        "left_wrist_0_rgb",
+        "right_wrist_0_rgb",
+    }
+    for name, image in observation.images.items():
+        assert image.shape == (1, 3, 224, 224)
+        assert torch.isfinite(image).all() and observation.image_masks[name].all()
+    assert observation.tokenized_prompt.shape == (1, 200)
+    assert observation.tokenized_prompt_mask.any()
     assert (
-        batch[0].images["base_0_rgb"].mean()
-        < batch[0].images["left_wrist_0_rgb"].mean()
+        observation.images["base_0_rgb"].mean()
+        < observation.images["left_wrist_0_rgb"].mean()
     )
     assert (
-        batch[0].images["left_wrist_0_rgb"].mean()
-        < batch[0].images["right_wrist_0_rgb"].mean()
+        observation.images["left_wrist_0_rgb"].mean()
+        < observation.images["right_wrist_0_rgb"].mean()
     )
 
 

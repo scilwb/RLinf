@@ -20,6 +20,7 @@ import pathlib
 import openpi.models.model as model
 from openpi import transforms
 from openpi.training.config import DataConfig, DataConfigFactory, ModelTransformFactory
+from typing_extensions import override
 
 from rlinf.models.embodiment.openpi.policies.yam_policy import YamInputs, YamOutputs
 
@@ -30,6 +31,7 @@ class LeRobotYamDataConfig(DataConfigFactory):
 
     default_prompt: str | None = None
 
+    @override
     def create(
         self, assets_dirs: pathlib.Path, model_config: model.BaseModelConfig
     ) -> DataConfig:
