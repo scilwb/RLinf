@@ -760,10 +760,96 @@ def pyagxarm() -> dict[str, types.ModuleType]:
     }
 
 
+def i2rt() -> dict[str, types.ModuleType]:
+    """Return the YAM SDK boundary with normalized seven-DoF feedback."""
+
+    class ArmType(Enum):
+        YAM = "yam"
+
+        @classmethod
+        def from_string_name(cls, name):
+            return cls(name)
+
+    class GripperType(Enum):
+        FLEXIBLE_4310 = "flexible_4310"
+
+        @classmethod
+        def from_string_name(cls, name):
+            return cls(name)
+
+    class YamRobot:
+        instances: list[Any] = []
+
+        def __init__(self, channel, **settings):
+            self.instances.append(self)
+            self.channel = channel
+            self.settings = settings
+            self.position = np.array([0.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.5])
+            self.commands: list[np.ndarray] = []
+            self.closed = False
+            self.feedback_age_s = 0.0
+            self._stop_event = threading.Event()
+            self._server_thread = types.SimpleNamespace(
+                is_alive=lambda: not self._stop_event.is_set(),
+                join=lambda timeout=None: None,
+            )
+            self.motor_chain = types.SimpleNamespace(running=True)
+            self.motor_chain._control_thread = types.SimpleNamespace(
+                is_alive=lambda: self.motor_chain.running,
+                join=lambda timeout=None: None,
+            )
+            self.limits = np.array(
+                [
+                    [-2.61799, 3.14159],
+                    [0.0, 3.66519],
+                    [0.0, 3.14159],
+                    [-1.69297, 1.5708],
+                    [-1.5708, 1.5708],
+                    [-2.0944, 2.0944],
+                ]
+            )
+
+        @property
+        def _joint_state(self):
+            return types.SimpleNamespace(timestamp=time.time() - self.feedback_age_s)
+
+        def get_joint_pos(self):
+            if self.closed:
+                raise RuntimeError("fake YAM robot is closed")
+            return self.position.copy()
+
+        def command_joint_pos(self, target):
+            target = np.asarray(target, dtype=np.float64).reshape(7).copy()
+            target[:6] = np.clip(target[:6], self.limits[:, 0], self.limits[:, 1])
+            target[6] = np.clip(target[6], 0.0, 1.0)
+            self.commands.append(target.copy())
+            self.position = target
+
+        def get_robot_info(self):
+            return {"joint_limits": self.limits.copy()}
+
+        def close(self):
+            self._stop_event.set()
+            self.motor_chain.running = False
+            self.closed = True
+
+    parents = package("i2rt.robots.get_robot")
+    get_robot = module(
+        "i2rt.robots.get_robot", get_yam_robot=YamRobot, YamRobot=YamRobot
+    )
+    utils = module("i2rt.robots.utils", ArmType=ArmType, GripperType=GripperType)
+    return {
+        **{parent.__name__: parent for parent in parents},
+        get_robot.__name__: get_robot,
+        utils.__name__: utils,
+    }
+
+
 def modules(**_: Any) -> dict[str, types.ModuleType]:
     """Return fake arm SDKs keyed by import name."""
     made = {"franky": franky()}
     made.update(ros())
     made.update(lerobot())
     made.update(pyagxarm())
+    made.update(i2rt())
     return made

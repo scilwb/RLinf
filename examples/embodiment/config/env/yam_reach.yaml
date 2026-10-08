@@ -1,0 +1,21 @@
+defaults:
+  - realworld_dual_yam_joint
+  - _self_
+
+env_type: real
+auto_reset: true
+ignore_terminations: true
+teleop: none
+keyboard_intervention_wrapper: false
+no_gripper: false
+
+init_params:
+  id: DualYamReachEnv-v1
+
+override_cfg:
+  target_joint_qpos:
+    - [0.0, 1.0, 1.0, 0.0, 0.0, 0.0]
+    - [0.0, 1.0, 1.0, 0.0, 0.0, 0.0]
+  reward_threshold: 0.05
+  success_hold_steps: 2
+  use_dense_reward: false

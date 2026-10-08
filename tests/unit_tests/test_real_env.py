@@ -4427,3 +4427,224 @@ def test_robotwin_eval_success_seed_order_is_controlled_by_base_seed():
 
     assert selected_seed_0 == selected_seed_0_again
     assert selected_seed_0 != selected_seed_1
+
+
+def _yam_sdk_env_settings():
+    from rlinf.robotics import DualYamConfig
+
+    config = OmegaConf.load(
+        _ROOT / "tests/e2e_tests/embodied/yam_mock_sac_mlp_reach.yaml"
+    )
+    hardware = DualYamConfig(
+        **OmegaConf.to_container(config.cluster.node_groups[0].hardware.configs[0])
+    )
+    settings = OmegaConf.to_container(
+        OmegaConf.load(
+            _ROOT / "examples/embodiment/config/env/realworld_dual_yam_joint.yaml"
+        ).override_cfg
+    )
+    settings.update(
+        step_frequency=1000.0, max_num_steps=3, image_height=48, image_width=64
+    )
+    return settings, _robot_info(hardware)
+
+
+def test_yam_sdk_env_clips_commands_reads_three_cameras_and_closes():
+    from robot_mocks import mocked_sdks
+
+    from rlinf.envs.real.yam import DualYamJointEnv
+
+    with mocked_sdks() as sdks:
+        settings, hardware = _yam_sdk_env_settings()
+        env = DualYamJointEnv(settings, robot_info=hardware)
+        try:
+            observation, _ = env.reset()
+            assert observation in env.observation_space
+            assert observation["state"]["joint_position"].shape == (14,)
+            assert [(part.name, part.width) for part in env.action_parts()] == [
+                ("left.arm", 6),
+                ("left.end_effector", 1),
+                ("right.arm", 6),
+                ("right.end_effector", 1),
+            ]
+            assert sdks["pyrealsense2"].opened == ["MOCK0001", "MOCK0002", "MOCK0003"]
+            action = observation["state"]["joint_position"].copy()
+            action[0] += 1.0
+            action[6], action[13] = -2.0, 2.0
+            observation, reward, terminated, _, info = env.step(action)
+            assert reward == 0.0 and not terminated
+            assert info["action_clipped"]
+            assert observation["state"]["joint_position"][0] == pytest.approx(0.05)
+            assert observation["state"]["joint_position"][[6, 13]].tolist() == [
+                0.0,
+                1.0,
+            ]
+            for _ in range(2):
+                observation, _, _, truncated, _ = env.step(
+                    observation["state"]["joint_position"]
+                )
+            assert truncated
+        finally:
+            env.close()
+            env.close()
+        assert all(
+            robot.closed for robot in sdks["i2rt.robots.get_robot"].YamRobot.instances
+        )
+        with pytest.raises(RuntimeError, match="closed"):
+            env.observe()
+
+
+@pytest.mark.parametrize("dense", [False, True])
+def test_yam_reach_scores_measured_feedback_not_the_requested_action(dense):
+    from robot_mocks import mocked_sdks
+
+    from rlinf.envs.real.yam import DualYamReachEnv
+
+    with mocked_sdks():
+        settings, hardware = _yam_sdk_env_settings()
+        target = [[1.0, 1.0, 1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 1.0, 0.0, 0.0, 0.0]]
+        env = DualYamReachEnv(
+            {**settings, "target_joint_qpos": target, "use_dense_reward": dense},
+            robot_info=hardware,
+        )
+        try:
+            observation, _ = env.reset()
+            requested = observation["state"]["joint_position"].copy()
+            requested[0] = 1.0
+            _, reward, terminated, _, info = env.step(requested)
+            assert info["joint_distance"] == pytest.approx(0.95)
+            assert reward == pytest.approx(-0.95 if dense else 0.0)
+            assert not terminated
+        finally:
+            env.close()
+
+
+def test_yam_sdk_env_surfaces_stale_feedback_and_releases_devices():
+    from robot_mocks import mocked_sdks
+
+    from rlinf.envs.real.yam import DualYamJointEnv
+
+    with mocked_sdks() as sdks:
+        settings, hardware = _yam_sdk_env_settings()
+        env = DualYamJointEnv(settings, robot_info=hardware)
+        try:
+            observation, _ = env.reset()
+            robots = sdks["i2rt.robots.get_robot"].YamRobot.instances
+            robots[1].feedback_age_s = 1.0
+            with pytest.raises(RuntimeError, match="stale YAM feedback"):
+                env.step(observation["state"]["joint_position"])
+        finally:
+            env.close()
+        assert len(robots) == 2 and all(robot.closed for robot in robots)
+
+
+def test_yam_reach_holds_target_ignores_grippers_and_resets_counters():
+    from robot_mocks import mocked_sdks
+
+    from rlinf.envs.real.yam import DualYamReachEnv
+
+    with mocked_sdks():
+        settings, hardware = _yam_sdk_env_settings()
+        env = DualYamReachEnv(
+            {
+                **settings,
+                "target_joint_qpos": [[0.0, 1.0, 1.0, 0.0, 0.0, 0.0]] * 2,
+                "success_hold_steps": 2,
+            },
+            robot_info=hardware,
+        )
+        try:
+            observation, _ = env.reset()
+            action = observation["state"]["joint_position"].copy()
+            action[6], action[13] = 0.1, 0.8
+            _, reward, terminated, _, _ = env.step(action)
+            assert reward == 1.0 and not terminated
+            assert env.step(action)[2]
+            env.reset()
+            assert not env.step(action)[2]
+            assert env.step(action)[2]
+        finally:
+            env.close()
+
+
+@pytest.mark.parametrize(
+    "target", [[0.0] * 12, [[float("nan")] * 6] * 2, [[10.0] * 6] * 2]
+)
+def test_yam_reach_rejects_invalid_targets_before_opening_sdk(target):
+    from robot_mocks import mocked_sdks
+
+    from rlinf.envs.real.yam import DualYamReachEnv
+
+    with mocked_sdks() as sdks:
+        settings, hardware = _yam_sdk_env_settings()
+        with pytest.raises(ValueError, match="target_joint_qpos"):
+            DualYamReachEnv(
+                {**settings, "target_joint_qpos": target}, robot_info=hardware
+            )
+        assert not sdks["i2rt.robots.get_robot"].YamRobot.instances
+
+
+def test_yam_realworld_wrapper_runs_the_mock_e2e_config(monkeypatch):
+    from hydra import compose, initialize_config_dir
+    from robot_mocks import mocked_sdks
+
+    monkeypatch.setenv("REPO_PATH", str(_ROOT))
+    with initialize_config_dir(
+        version_base=None, config_dir=str(_ROOT / "tests/e2e_tests/embodied")
+    ):
+        config = compose(config_name="yam_mock_sac_mlp_reach")
+    with mocked_sdks():
+        from rlinf.envs.real import RealWorldEnv
+
+        _, hardware = _yam_sdk_env_settings()
+        env = RealWorldEnv(
+            config.env.train,
+            num_envs=1,
+            seed_offset=0,
+            total_num_processes=1,
+            worker_info=SimpleNamespace(hardware_infos=[hardware], cluster_node_rank=0),
+        )
+        try:
+            observation, _ = env.reset()
+            assert observation["states"].shape == (1, 14)
+            assert observation["main_images"].shape == (1, 48, 64, 3)
+            assert observation["extra_view_images"].shape == (1, 2, 48, 64, 3)
+            for _ in range(10):
+                observation, reward, terminated, truncated, _ = env.step(
+                    observation["states"]
+                )
+                assert torch.isfinite(reward).all()
+                assert not terminated.any()
+            assert truncated.all()
+        finally:
+            env.close()
+
+
+def test_yam_hardware_check_requires_operator_confirmation_and_runs_with_sdk_fakes(
+    tmp_path,
+):
+    from robot_mocks import mocked_sdks
+
+    command = [sys.executable, "-m", "toolkits.realworld_check.test_yam_env"]
+    guard = subprocess.run(
+        command + ["--once"], capture_output=True, text=True, cwd=_ROOT, timeout=30
+    )
+    assert guard.returncode != 0
+    assert "--confirm-hardware-ready" in guard.stderr
+    with mocked_sdks():
+        checked = subprocess.run(
+            command + ["--mock", "--enable-motion", "--snapshot-dir", str(tmp_path)],
+            input="joint left 0 nan\njoint left 0 0.03\njoint left 0 0.01\nMOVE\ngripper right 0.05\nMOVE\nquit\n",
+            capture_output=True,
+            text=True,
+            cwd=_ROOT,
+            timeout=30,
+        )
+    assert checked.returncode == 0, checked.stdout + checked.stderr
+    assert "delta must be finite" in checked.stdout + checked.stderr
+    assert "YAM runtime and cameras closed" in checked.stdout + checked.stderr
+    assert sorted(path.name for path in tmp_path.glob("*.png")) == [
+        "left_rgb.png",
+        "right_rgb.png",
+        "top_rgb.png",
+    ]

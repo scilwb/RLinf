@@ -23,6 +23,7 @@ from rlinf.envs.real.yam.config import (
 from rlinf.envs.real.yam.control_runtime import YamControlRuntime
 from rlinf.envs.real.yam.dual_yam_joint_env import DualYamJointEnv
 from rlinf.envs.real.yam.pico_episode import YamPicoEpisode
+from rlinf.envs.real.yam.reach import DualYamReachEnv
 from rlinf.envs.real.yam.types import (
     DualYamState,
     YamArmState,
@@ -32,13 +33,17 @@ from rlinf.envs.real.yam.types import (
 #: Gymnasium IDs mapped to the YAM environments that build them. Registering
 #: the class, rather than an entry point of its own, is what lets the shared
 #: wrapper stack apply the teleop device and its episode control.
-TASKS: dict[str, type] = {"DualYamJointEnv-v1": DualYamJointEnv}
+TASKS: dict[str, type] = {
+    "DualYamJointEnv-v1": DualYamJointEnv,
+    "DualYamReachEnv-v1": DualYamReachEnv,
+}
 
 _ENTRY_POINTS = register_tasks(__name__, globals(), TASKS)
 
 __all__ = [
     "DualYamJointEnv",
     "DualYamJointEnvConfig",
+    "DualYamReachEnv",
     "DualYamState",
     "YamArmState",
     "YamCommandResult",
