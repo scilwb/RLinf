@@ -53,6 +53,7 @@ FROM ${KUNLUN_BASE_IMAGE} AS base-image-platform-kunlun
 # Base images for different build targets — all derive from the platform base
 ##################################################################################################
 FROM base-image-platform-${PLATFORM} AS base-image-reason
+FROM base-image-platform-${PLATFORM} AS base-image-embodied-yam-openpi
 FROM base-image-platform-${PLATFORM} AS base-image-embodied-maniskill_libero
 FROM base-image-platform-${PLATFORM} AS base-image-embodied-behavior-openvlaoft
 FROM base-image-platform-${PLATFORM} AS base-image-embodied-behavior-openpi
@@ -315,6 +316,11 @@ RUN link_assets
 # Set default env
 RUN echo "source ${UV_PATH}/openpi/bin/activate" >> ~/.bashrc
 
+
+FROM embodied-common-image AS embodied-yam-openpi-image
+
+RUN bash requirements/install.sh ${INSTALL_MIRROR_OPTION} --platform ${RLINF_PLATFORM} embodied --venv openpi --model openpi --env yam
+RUN echo "source ${UV_PATH}/openpi/bin/activate" >> ~/.bashrc
 
 ##################################################################################################
 # Embodied: RoboCasa

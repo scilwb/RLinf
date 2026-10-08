@@ -46,3 +46,99 @@ Replace every placeholder with a value checked at your station. The example conf
 Hold a controller's grip to control its corresponding arm; release it to stop taking over. The recipe maps the right menu button to start/end an episode and the left menu button to discard the current recording. Confirm these button events on your PICO setup before collecting task data. Discard removes only the current unfinished episode; faulted or truncated recordings can still be saved as unsuccessful episodes.
 
 The launcher writes logs under ``logs/<timestamp>-realworld_dual_yam_collect_data_pico/`` by default. LeRobot data is written under that run's ``collected_data/rank_*/`` directory. Streaming saves recorded episodes, including unsuccessful ones, with an ``is_success`` flag; inspect that flag and the three RGB views before using the dataset. A saved episode or an ``is_success`` flag does not replace the operator's task-result check.
+
+Fine-tune from recorded data
+------------------------------
+
+Fine-tune Pi0.5 on a finalized YAM LeRobot dataset before deploying a policy.
+The SFT recipe uses recorded files and starts only actor workers. Select one
+curated dataset directory containing ``meta/info.json``; the collection run's
+``rank_*/`` parent directory is not a dataset. Streaming collection can produce
+one ``id_*/`` shard per episode, so prepare a curated dataset containing the
+episodes you intend to train on. Check task labels and success/fault outcomes
+before including recordings.
+
+Merge the selected finalized shards with the existing preparation tool:
+
+.. code-block:: bash
+
+   python toolkits/lerobot/merge_lerobot_datasets.py \
+     --source-dir /absolute/path/to/selected_shards \
+     --output-dir /absolute/path/to/yam_dataset --dry-run
+   python toolkits/lerobot/merge_lerobot_datasets.py \
+     --source-dir /absolute/path/to/selected_shards \
+     --output-dir /absolute/path/to/yam_dataset
+
+The first command lists the inputs without writing. Review that list before
+the second command merges all episodes under those selected input directories.
+It does not filter successful episodes automatically; curate inputs first.
+
+Install the model and YAM dependencies in a separate environment:
+
+.. code-block:: bash
+
+   bash requirements/install.sh embodied --venv .venv-yam-openpi --model openpi --env yam
+   source .venv-yam-openpi/bin/activate
+   export PYTHONPATH="$PWD:$PYTHONPATH"
+   export EMBODIED_PATH="$PWD/examples/embodiment"
+
+This explicitly adds OpenPI to the YAM environment. The collection-only command
+remains unchanged. A container uses ``BUILD_TARGET=embodied-yam-openpi``.
+Supply a Pi0.5 PyTorch checkpoint separately; the installer downloads model
+runtime assets, not your fine-tuned policy weights.
+
+The ``pi05_yam`` data configuration preserves absolute joint targets and the
+left-arm-first 14-value order. It maps ``image``, ``extra_view_image-0`` and
+``extra_view_image-1`` to OpenPI's base, left and right RGB slots. All three
+views are required. Model state/actions are zero-padded to 32 values, and the
+prediction horizon is 10 frames. It does not apply Aloha joint/gripper
+conversions or convert absolute targets into deltas.
+
+Compute YAM normalization statistics rather than using another robot's stats:
+
+.. code-block:: bash
+
+   python toolkits/lerobot/calculate_norm_stats.py \
+     --config-name pi05_yam --repo-id /absolute/path/to/yam_dataset
+
+With an absolute dataset path, this tool writes ``norm_stats.json`` into that
+dataset directory. Use enough frames for the configured 32-sample statistics
+batch. Keep the checkpoint, dataset, and stats paths explicit in the SFT config
+or command-line overrides.
+
+Validate data on CPU first, then run forward, backward and optimizer updates
+on a training machine with sufficient model memory:
+
+.. code-block:: bash
+
+   python examples/sft/validate_openpi_sft.py \
+     data.train_data_paths=/absolute/path/to/yam_dataset \
+     actor.model.model_path=/absolute/path/to/pi05_pytorch \
+     actor.model.openpi_data.norm_stats_path=/absolute/path/to/yam_dataset/norm_stats.json
+
+   python examples/sft/validate_openpi_sft.py \
+     data.train_data_paths=/absolute/path/to/yam_dataset \
+     actor.model.model_path=/absolute/path/to/pi05_pytorch \
+     actor.model.openpi_data.norm_stats_path=/absolute/path/to/yam_dataset/norm_stats.json \
+     validation.mode=train validation.device=cuda validation.steps=2
+
+The data check verifies three enabled RGB views, language tokens, finite
+32-value model tensors, and the 10-frame action window. Train mode loads the
+checkpoint, checks a finite scalar loss and nonzero finite gradients, then
+applies AdamW updates in memory. It does not overwrite checkpoint files.
+Passing these checks establishes data/optimization compatibility, not policy
+quality or safe robot behavior.
+
+Start full SFT through the existing entry point after validation:
+
+.. code-block:: bash
+
+   python examples/sft/train_vla_sft.py \
+     --config-name realworld_dual_yam_sft_openpi_pi05 \
+     data.train_data_paths=/absolute/path/to/yam_dataset \
+     actor.model.model_path=/absolute/path/to/pi05_pytorch \
+     actor.model.openpi_data.norm_stats_path=/absolute/path/to/yam_dataset/norm_stats.json
+
+This launches the existing Ray/FSDP SFT runner using the YAM recipe. Read
+training loss and saved checkpoints before planning inference validation;
+hardware execution requires a separate attended safety check.

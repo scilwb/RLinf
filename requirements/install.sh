@@ -2303,6 +2303,13 @@ install_openvla_oft_model() {
 
 install_openpi_model() {
     case "$ENV_NAME" in
+        yam)
+            create_and_sync_venv
+            install_common_embodied_deps
+            install_yam_env
+            uv pip install "rlinf-openpi==0.1.1"
+            install_flash_attn
+            ;;
         behavior)
             PYTHON_VERSION="3.10"
             create_and_sync_venv

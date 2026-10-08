@@ -60,6 +60,188 @@ class _DummyModel:
         return self
 
 
+def test_yam_openpi_preserves_absolute_14d_order_and_three_rgb_views():
+    pytest.importorskip("openpi.transforms")
+    from rlinf.models.embodiment.openpi.policies.yam_policy import YamInputs, YamOutputs
+
+    state = np.arange(14, dtype=np.float32)
+    actions = np.stack([state, state + 1])
+    data = {
+        "observation/state": state,
+        "actions": actions,
+        "observation/image": np.full((8, 10, 3), 11, dtype=np.uint8),
+        "observation/left_image": np.full((8, 10, 3), 22, dtype=np.uint8),
+        "observation/right_image": np.full((3, 8, 10), 33, dtype=np.uint8),
+        "prompt": b"pick block",
+    }
+    transformed = YamInputs()(data)
+    np.testing.assert_array_equal(transformed["state"][:14], state)
+    np.testing.assert_array_equal(transformed["state"][14:], 0)
+    np.testing.assert_array_equal(transformed["actions"][:, :14], actions)
+    np.testing.assert_array_equal(transformed["actions"][:, 14:], 0)
+    assert transformed["image"]["base_0_rgb"].mean() == 11
+    assert transformed["image"]["left_wrist_0_rgb"].mean() == 22
+    assert transformed["image"]["right_wrist_0_rgb"].mean() == 33
+    assert all(transformed["image_mask"].values())
+    assert transformed["prompt"] == "pick block"
+    np.testing.assert_array_equal(YamOutputs()(transformed)["actions"], actions)
+
+
+@pytest.mark.parametrize(
+    "invalid_field",
+    ["state_width", "state_nan", "action_width", "action_nan", "rgb_nan"],
+)
+def test_yam_openpi_rejects_invalid_demonstrations(invalid_field):
+    pytest.importorskip("openpi.transforms")
+    from rlinf.models.embodiment.openpi.policies.yam_policy import YamInputs
+
+    data = {
+        "observation/state": np.zeros(14, dtype=np.float32),
+        "actions": np.zeros((10, 14), dtype=np.float32),
+        "observation/image": np.zeros((8, 10, 3), dtype=np.uint8),
+        "observation/left_image": np.zeros((8, 10, 3), dtype=np.uint8),
+        "observation/right_image": np.zeros((8, 10, 3), dtype=np.uint8),
+    }
+    if invalid_field == "state_width":
+        data["observation/state"] = np.zeros(13)
+    elif invalid_field == "state_nan":
+        data["observation/state"][0] = np.nan
+    elif invalid_field == "action_width":
+        data["actions"] = np.zeros((10, 16))
+    elif invalid_field == "action_nan":
+        data["actions"][0, 0] = np.nan
+    else:
+        data["observation/image"] = np.full((8, 10, 3), np.nan)
+    with pytest.raises(ValueError):
+        YamInputs()(data)
+
+
+def test_yam_openpi_sft_recipe_composes_without_station_configuration(monkeypatch):
+    from hydra import compose, initialize_config_dir
+
+    repo_path = Path(__file__).resolve().parents[2]
+    monkeypatch.setenv("EMBODIED_PATH", str(repo_path / "examples/embodiment"))
+    with initialize_config_dir(
+        config_dir=str(repo_path / "examples/sft/config"), version_base="1.1"
+    ):
+        cfg = compose(config_name="realworld_dual_yam_sft_openpi_pi05")
+    resolved = OmegaConf.to_container(cfg, resolve=True)
+    assert resolved["actor"]["model"]["action_dim"] == 14
+    assert resolved["actor"]["model"]["openpi"]["model_action_dim"] == 32
+    assert resolved["actor"]["model"]["openpi"]["config_name"] == "pi05_yam"
+    assert resolved["actor"]["model"]["openpi"]["num_images_in_input"] == 3
+    assert "env" not in resolved
+    assert "rollout" not in resolved
+    assert resolved["cluster"]["component_placement"] == {"actor": "all"}
+
+
+def test_openpi_validation_step_updates_parameters_and_rejects_nonfinite_loss():
+    from examples.sft.validate_openpi_sft import apply_validation_step
+
+    model = torch.nn.Linear(14, 14)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.01)
+    before = model.weight.detach().clone()
+    loss = model(torch.ones(2, 14)).square().mean()
+    metrics = apply_validation_step(loss, model, optimizer, clip_grad=1.0)
+    assert np.isfinite(metrics["loss"])
+    assert metrics["grad_norm"] > 0
+    assert not torch.equal(before, model.weight)
+    with pytest.raises(ValueError, match="finite scalar loss"):
+        apply_validation_step(
+            torch.tensor(float("nan")), model, optimizer, clip_grad=1.0
+        )
+
+
+def test_yam_openpi_recorded_dataset_uses_the_official_sft_loader(
+    tmp_path, monkeypatch
+):
+    pytest.importorskip("openpi.transforms")
+    pytest.importorskip("lerobot.common.datasets.lerobot_dataset")
+    from hydra import compose, initialize_config_dir
+    from openpi.models import tokenizer
+    from openpi.shared import normalize
+
+    from examples.sft.validate_openpi_sft import validate_batch
+    from rlinf.data.datasets.openpi import build_openpi_sft_dataloader
+    from rlinf.data.storage.lerobot.writer import LeRobotDatasetWriter
+
+    class LocalTokenizer:
+        def __init__(self, max_len):
+            self.max_len = max_len
+
+        def tokenize(self, prompt, state=None):
+            return np.ones(self.max_len, dtype=np.int32), np.ones(
+                self.max_len, dtype=bool
+            )
+
+    monkeypatch.setattr(tokenizer, "PaligemmaTokenizer", LocalTokenizer)
+    dataset_path = tmp_path / "dataset"
+    writer = LeRobotDatasetWriter()
+    writer.create(
+        repo_id=str(dataset_path),
+        robot_type="dual_yam",
+        state_dim=14,
+        action_dim=14,
+        image_shape=(8, 10, 3),
+        extra_view_image_keys={
+            "extra_view_image-0": (8, 10, 3),
+            "extra_view_image-1": (8, 10, 3),
+        },
+        image_writer_threads=0,
+        image_writer_processes=0,
+    )
+    writer.add_episode(
+        [
+            {
+                "state": np.full(14, index / 10, dtype=np.float32),
+                "actions": np.full(14, (index + 1) / 10, dtype=np.float32),
+                "task": "pick block",
+                "image": np.full((8, 10, 3), 11, dtype=np.uint8),
+                "extra_view_image-0": np.full((8, 10, 3), 22, dtype=np.uint8),
+                "extra_view_image-1": np.full((8, 10, 3), 33, dtype=np.uint8),
+                "done": np.array([index == 9]),
+                "is_success": np.array([True]),
+                "intervene_flag": np.array([True]),
+            }
+            for index in range(10)
+        ]
+    )
+    writer.finalize()
+    norm_stats = {
+        key: normalize.NormStats(
+            mean=np.zeros(32), std=np.ones(32), q01=np.zeros(32), q99=np.ones(32)
+        )
+        for key in ("state", "actions")
+    }
+    normalize.save(tmp_path / "stats", norm_stats)
+    repo_path = Path(__file__).resolve().parents[2]
+    monkeypatch.setenv("EMBODIED_PATH", str(repo_path / "examples/embodiment"))
+    with initialize_config_dir(
+        config_dir=str(repo_path / "examples/sft/config"), version_base="1.1"
+    ):
+        cfg = compose(
+            config_name="realworld_dual_yam_sft_openpi_pi05",
+            overrides=[
+                f"data.train_data_paths={dataset_path}",
+                f"actor.model.openpi_data.norm_stats_path={tmp_path / 'stats/norm_stats.json'}",
+            ],
+        )
+    loader, _ = build_openpi_sft_dataloader(
+        cfg, world_size=1, rank=0, data_paths=str(dataset_path)
+    )
+    batch = next(iter(loader))
+    metrics = validate_batch(batch, cfg.actor.model)
+    assert metrics == {"batch_size": 1, "action_horizon": 10, "model_action_dim": 32}
+    assert (
+        batch[0].images["base_0_rgb"].mean()
+        < batch[0].images["left_wrist_0_rgb"].mean()
+    )
+    assert (
+        batch[0].images["left_wrist_0_rgb"].mean()
+        < batch[0].images["right_wrist_0_rgb"].mean()
+    )
+
+
 class _DummyBlock(torch.nn.Module):
     def __init__(self):
         super().__init__()
